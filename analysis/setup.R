@@ -23,6 +23,7 @@ library(signal, warn.conflicts = F, quietly = T) # signal processing functions
 library(oce, warn.conflicts = F, quietly = T) # image plotting functions and nice color maps
 library(tuneR, warn.conflicts = F, quietly = T) # nice functions for reading and manipulating .wav files
 library(glmnet)
+library(glmmLasso)
 
 # 9 colours for categorical variables
 cols <- brewer.pal(9, 'Set1') %>% scales::alpha(alpha=0.5)
@@ -34,11 +35,13 @@ opcols <- brewer.pal(9, 'Set1')
 load('data/nscv_smooth_formant.RData') # Smoothed NSCV formants
 load('data/nscv_smooth_mfcc.RData') # Smoothed NSCV MFCCs
 load('data/nscv_log.RData') # NSCV metadata
+load('data/nscv_aligned.RData')
+load('data/nscv_aligned_cv.RData')
 
 # BNC data 
 load('data/locations.RData') # BNC location coordinates
-load('data/bnc_aligned.RData') # Aligned BNC MFCCs and formants
 load('data/bnc_log.RData') # BNC metadata
+load('data/bnc_aligned_to_nscv.RData')
 
 # Maps
 data(countriesHigh)

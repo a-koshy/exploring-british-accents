@@ -23,12 +23,16 @@ File descriptions:
 
 - nscv_raw_formant.RData, nscv_raw_mfcc.RData, nscv_smooth_formant.RData and nscv_smooth_mfcc.RData contain the raw and preprocessed formants and MFCCs respectively, extracted from the NSCV audio files.
 
+- nscv_aligned.RData contains aligned formants, aligned MFCCs and warping functions for NSCV vowels, and the mean NSCV MFCC 1 curve.
+
+- nscv_aligned_cv.RData contains aligned NSCV formants and MFCCs within CV folds to save time while cross-validating models.
+
 - bnc_sounds.rda contains audio for the BNC vowel sounds.
 
 - bnc_raw_formant.RData, bnc_raw_mfcc.RData, bnc_smooth_formant.RData and bnc_smooth_mfcc.RData
 contain the raw and preprocessed formants and MFCCs respectively, extracted from the BNC sounds in bnc_sounds.rda.
 
-- bnc_aligned.RData contains MFCCs, formants and warping functions after alignment of MFCC 1 curves within BNC speakers.
+- bnc_aligned_to_nscv.RData contains MFCCs, formants and warping functions after BNC vowels are aligned to NSCV vowels using MFCC 1.
 
 - aa-index-to-remove.RData contains indices of BNC sounds which contained high amounts of background noise and were removed.
 
@@ -45,11 +49,13 @@ File descriptions:
 
 - setup.R loads libraries and datasets. 
 
-- functions.R contains helper functions for preprocessing, plotting, model diagnostics and working with audio files.
+- functions.R contains helper functions for preprocessing, plotting, cross-validation and model diagnostics and working with audio files.
 
 - models.R contains code for fitting the models presented in the paper.
 
-- plots.R generates figures and other outputs.
+- outputs.R generates figures and other outputs.
+
+- model-selection.R generates model selection results.
 
 - preprocessing.R contains the code that recreates the preprocessed NSCV and BNC datasets starting from the audio files. The ahocoder software (https://aholab.ehu.eus/ahocoder/) needs to be installed separately for extracting MFCCs from sounds or resynthesizing sounds from MFCCs.
 
@@ -76,4 +82,4 @@ Contact address: S.Tavakoli@warwick.ac.uk
 
 5. VERSION
 ----------
-Version 1.0 (26 August 2020)
+Version 1.1 (13 June 2021)

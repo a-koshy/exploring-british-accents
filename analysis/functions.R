@@ -365,7 +365,7 @@ createsound <- function(mfccmatrix, length=100, file=NULL,
                   output.file = file)
 }
 
-# Perturb sound towards S/N accent using PLR model
+# Perturb vowel towards S/N accent using MFCC model
 perturbsound <- function(infile, outfile, starttime, endtime, seqlength=5,
                          NtoS=T){
     # Extract MFCCs from infile
@@ -373,10 +373,21 @@ perturbsound <- function(infile, outfile, starttime, endtime, seqlength=5,
     inmfcc <- insound$mfcc
     inf0 <- insound$f0
     # Identify MFCC section corresponding to vowel
-    start <- floor(starttime*200)
+    start <- max(floor(starttime*200), 1)
     end <- ceiling(endtime*200)
+    
+    # smooth and warp the original vowel
+    vowel_smooth_mfcc = smooth_mfccs(list(inmfcc[start:end,]), resolution = 40)
+    vowel_warping = pair_align_functions(f1=nscvmean,
+                                         f2=vowel_smooth_mfcc$mfcc_norm[,1,1],
+                                         time=seq(0,1,length.out = 40))$gam
+    # warped_vowel_mfcc = align_matrix(as.matrix(vowel_warping), vowel_smooth_mfcc$mfcc_norm)
+    # Unwarp the beta matrix using the vowel warping
+    unwarped_contrib = align_matrix(as.matrix(invertGamma(vowel_warping)),
+                                    array(sumcontrib, dim=c(40,1,40)))
+    
     # Rescale perturbation matrix accordingly
-    vowelcontrib <- smooth_mfccs(list(sumcontrib), resolution=end-start+1)
+    vowelcontrib <- smooth_mfccs(list(unwarped_contrib[,1,]), resolution=end-start+1)
     # Pad with zeroes
     addmfcc <- matrix(0, nrow=nrow(inmfcc), ncol=40)
     addmfcc[start:end,] <- vowelcontrib$mfcc_norm
@@ -401,7 +412,247 @@ perturbsound <- function(infile, outfile, starttime, endtime, seqlength=5,
     return(print('Success!'))
 }
 
+# Model comparison or calibration by perturbing vowels #
+perturbsound_comparison <- function(infile, starttime, endtime, 
+                                    prob_sequence=seq(-12, 12, by=1),
+                                    f_model=formant_model,
+                                    sumcontrib,
+                                    shorter = c(10,15,20,25,30)){
+    if (!exists('nscvmean')) {
+        load('data/nscv_aligned.RData')
+    }
+    
+    if (!exists('mfccpm')) {
+        print('FPCA matrix and model not found.')
+    }
+    
+    # Extract MFCCs from infile
+    insound <- sound_to_mfcc(infile)
+    inmfcc <- insound$mfcc
+    inf0 <- insound$f0
+    # Identify MFCC section corresponding to vowel
+    start <- max(floor(starttime*200), 1)
+    end <- ceiling(endtime*200)
+    
+    # smooth and warp the vowel
+    vowel_smooth_mfcc = smooth_mfccs(list(inmfcc[start:end,]), resolution = 40)
+    vowel_warping = pair_align_functions(f1=nscvmean,
+                                         f2=vowel_smooth_mfcc$mfcc_norm[,1,1],
+                                         time=seq(0,1,length.out = 40))$gam
+    warped_vowel_mfcc = align_matrix(as.matrix(vowel_warping), vowel_smooth_mfcc$mfcc_norm)
+    
+    # find link scale prediction for the original sound from PLR model
+    # project on FPCs
+    vowel_centred_mfcc <- warped_vowel_mfcc
+    vowel_centred_mfcc[,,1] <- warped_vowel_mfcc[,1,1] - mean(warped_vowel_mfcc[,1,1])
+    
+    # Stack MFCC curves into a single row
+    vowelstacked <- matrix(NA, nrow=1, ncol=40*40)
+    for(i in 1:40){
+        vowelstacked[,(40*(i-1)+1):(40*i)] <- vowel_centred_mfcc[,,i] %>% t()
+    }
+    
+    vowel_pcs = predict(mfccpm, vowelstacked)
+    vowellink <- as.numeric(predict(pcamodfull, vowel_pcs, type='link'))
+    
+    # calculate multiples of beta matrix to be added
+    alphas = (prob_sequence - vowellink)/sum(pcamodfull$beta^2)
+    original <- inmfcc[start:end,]
+    
+    # Unwarp the beta matrix using the vowel warping
+    unwarped_contrib = align_matrix(as.matrix(invertGamma(vowel_warping)),
+                                    array(sumcontrib, dim=c(40,1,40)))
+    # Resample perturbation matrix accordingly to fit duration of original vowel
+    vowelcontrib <- smooth_mfccs(list(unwarped_contrib[,1,]), resolution=end-start+1)
+    
+    # Create sounds along the sequence
+    formant_prediction <- c()
+    for (i in 1:length(alphas)){
+        warped_matrix = array(original+alphas[i]*vowelcontrib$mfcc_norm[,1,],
+                              dim=c(nrow(original), 1, 40))
+        file=paste0('output/comparison-', i, '.wav')
+        print(paste('Creating wav file:', file))
+        createsound(mfccmatrix = warped_matrix[,1,],
+                    f0=inf0[start:end],
+                    file=file,
+                    length=nrow(original))
+        
+        # extract formants, smooth and warp, predict under the formant model
+        alpha_formants <- forest(file, toFile = F)$fm
+        smoothedformants = smooth_robust(list(alpha_formants), r=0.4, degree=1)
+        warpedformants = align_matrix(as.matrix(vowel_warping), smoothedformants$formant_norm)
+        
+        newformantdata <- list(f2f = t(warpedformants[,,2]),
+                               time=matrix(seq(0,1, length.out = 40), ncol=40, nrow=1, byrow=T),
+                               id = factor('p1', levels=levels(factor(nscv_log$id))))
+        formant_prediction[i] = predict(f_model, newdata=newformantdata, type='link')
+        
+    }
+    return(list(mfcc_preds = prob_sequence,
+                formant_preds = formant_prediction,
+                alphas=alphas,
+                original_pred=vowellink,
+                vowel_warping = vowel_warping))
+}
+
+
 # Plotting and diagnostics ####
+
+# Function to cross validate formant models
+flr_cross_validate <- function(formula, align=T, bam=F, ...){
+    tseq = seq(0, 1, length.out=40)
+    
+    s <- split(1:400, nscv_log$id)
+    
+    acc <- c()
+    pred_response <- preds <- pred_link <- matrix(NA, 100, 4)
+    for (i in 1:4) {
+        
+        print(paste('Fold', i))
+        testind <- s[[i]]
+        
+        if (align==T) {
+            train_aligned_formant = nscv_cv_aligned[[i]]$train_aligned_formant
+            test_aligned_formant = nscv_cv_aligned[[i]]$test_aligned_formant
+            
+            shorter = c(10, 20, 30)
+            traindf <- list(gap=t(train_aligned_formant[,,2]-train_aligned_formant[,,1]),
+                            time=matrix(seq(0,1, length.out = 40), ncol=40, nrow=300, byrow=T),
+                            accent=as.factor(nscv_log$accent[-testind]),
+                            id=as.factor(nscv_log$id[-testind]),
+                            mic=as.factor(nscv_log$mic[-testind]),
+                            f2=apply(train_aligned_formant[,,2], 2, mean),
+                            f1=apply(train_aligned_formant[,,1], 2, mean),
+                            f1f = t(train_aligned_formant[,,1]),
+                            f2f = t(train_aligned_formant[,,2]),
+                            f1mid = (train_aligned_formant[20,,1]),
+                            f2mid = (train_aligned_formant[20,,2]),
+                            f1shorter = t(train_aligned_formant[shorter, , 1]),
+                            f2shorter = t(train_aligned_formant[shorter, , 2]),
+                            timeshorter = matrix(seq(0,1, length.out = length(shorter)), ncol=length(shorter), nrow=300, byrow=T),
+                            gapshorter = t(train_aligned_formant[shorter,,2] - train_aligned_formant[shorter,,1]))
+            
+            testdf <- list(gap=t(test_aligned_formant[,,2]-test_aligned_formant[,,1]),
+                           time=matrix(seq(0,1, length.out = 40), ncol=40, nrow=100, byrow=T),
+                           accent=as.factor(nscv_log$accent[testind]),
+                           id=as.factor(nscv_log$id[testind]),
+                           mic=as.factor(nscv_log$mic[testind]),
+                           f2=apply(test_aligned_formant[,,2], 2, mean),
+                           f1=apply(test_aligned_formant[,,1], 2, mean),
+                           f1f = t(test_aligned_formant[,,1]),
+                           f2f = t(test_aligned_formant[,,2]),
+                           f1mid = (test_aligned_formant[20,,1]),
+                           f2mid = (test_aligned_formant[20,,2]),
+                           f1shorter = t(test_aligned_formant[shorter, , 1]),
+                           f2shorter = t(test_aligned_formant[shorter, , 2]),
+                           timeshorter = matrix(seq(0,1, length.out = length(shorter)), ncol=length(shorter), nrow=100, byrow=T),
+                           gapshorter = t(test_aligned_formant[shorter,,2] - test_aligned_formant[shorter,,1]))
+            
+            fulldata = list(gap=t(nscv_aligned_formant[,,2]-nscv_aligned_formant[,,1]),
+                            time=matrix(seq(0,1, length.out = 40), ncol=40, nrow=400, byrow=T),
+                            accent=as.factor(nscv_log$accent),
+                            id=as.factor(nscv_log$id),
+                            mic=as.factor(nscv_log$mic),
+                            f2=apply(nscv_aligned_formant[,,2], 2, mean),
+                            f1=apply(nscv_aligned_formant[,,1], 2, mean),
+                            f1f = t(nscv_aligned_formant[,,1]),
+                            f2f = t(nscv_aligned_formant[,,2]),
+                            f1mid = (nscv_aligned_formant[20,,1]),
+                            f2mid = (nscv_aligned_formant[20,,2]),
+                            f1shorter = t(nscv_aligned_formant[shorter, , 1]),
+                            f2shorter = t(nscv_aligned_formant[shorter, , 2]),
+                            timeshorter = matrix(seq(0,1, length.out = length(shorter)), ncol=length(shorter), nrow=400, byrow=T),
+                            gapshorter = t(nscv_aligned_formant[shorter,,2] - nscv_aligned_formant[shorter,,1]))
+            
+        } else {
+            
+            traindf <- list(gap=t(nscv_smooth_formant$formant_norm[,-testind,2]-nscv_smooth_formant$formant_norm[,-testind,1]),
+                                       time=matrix(seq(0,1, length.out = 40), ncol=40, nrow=300, byrow=T),
+                                       accent=as.factor(nscv_log$accent[-testind]),
+                                       id=as.factor(nscv_log$id[-testind]),
+                                       mic=as.factor(nscv_log$mic[-testind]),
+                                       f2=apply(nscv_smooth_formant$formant_norm[,-testind,2], 2, mean),
+                                       f1=apply(nscv_smooth_formant$formant_norm[,-testind,1], 2, mean),
+                                       f1f = t(nscv_smooth_formant$formant_norm[,-testind,1]),
+                                       f2f = t(nscv_smooth_formant$formant_norm[,-testind,2]),
+                                       f1mid = (nscv_smooth_formant$formant_norm[20,-testind,1]),
+                                       f2mid = (nscv_smooth_formant$formant_norm[20,-testind,2]),
+                                       f1shorter = t(nscv_smooth_formant$formant_norm[shorter, -testind, 1]),
+                                       f2shorter = t(nscv_smooth_formant$formant_norm[shorter, -testind, 2]),
+                                       timeshorter = matrix(seq(0,1, length.out = length(shorter)), ncol=length(shorter), nrow=300, byrow=T),
+                                       gapshorter = t(nscv_smooth_formant$formant_norm[shorter,-testind,2] - nscv_smooth_formant$formant_norm[shorter,-testind,1]))
+    
+            testdf <- list(gap=t(nscv_smooth_formant$formant_norm[,testind,2]-nscv_smooth_formant$formant_norm[,testind,1]),
+                            time=matrix(seq(0,1, length.out = 40), ncol=40, nrow=100, byrow=T),
+                            accent=as.factor(nscv_log$accent[testind]),
+                            id=as.factor(nscv_log$id[testind]),
+                            mic=as.factor(nscv_log$mic[testind]),
+                            f2=apply(nscv_smooth_formant$formant_norm[,testind,2], 2, mean),
+                            f1=apply(nscv_smooth_formant$formant_norm[,testind,1], 2, mean),
+                            f1f = t(nscv_smooth_formant$formant_norm[,testind,1]),
+                            f2f = t(nscv_smooth_formant$formant_norm[,testind,2]),
+                            f1mid = (nscv_smooth_formant$formant_norm[20,testind,1]),
+                            f2mid = (nscv_smooth_formant$formant_norm[20,testind,2]),
+                            f1shorter = t(nscv_smooth_formant$formant_norm[shorter, testind, 1]),
+                            f2shorter = t(nscv_smooth_formant$formant_norm[shorter, testind, 2]),
+                            timeshorter = matrix(seq(0,1, length.out = length(shorter)), ncol=length(shorter), nrow=100, byrow=T),
+                            gapshorter = t(nscv_smooth_formant$formant_norm[shorter,testind,2] - nscv_smooth_formant$formant_norm[shorter,testind,1]))
+            
+            fulldata = list(gap=t(nscv_smooth_formant$formant_norm[,,2]-nscv_smooth_formant$formant_norm[,,1]),
+                            time=matrix(seq(0,1, length.out = 40), ncol=40, nrow=400, byrow=T),
+                            accent=as.factor(nscv_log$accent),
+                            id=as.factor(nscv_log$id),
+                            mic=as.factor(nscv_log$mic),
+                            f2=apply(nscv_smooth_formant$formant_norm[,,2], 2, mean),
+                            f1=apply(nscv_smooth_formant$formant_norm[,,1], 2, mean),
+                            f1f = t(nscv_smooth_formant$formant_norm[,,1]),
+                            f2f = t(nscv_smooth_formant$formant_norm[,,2]),
+                            f1mid = (nscv_smooth_formant$formant_norm[20,,1]),
+                            f2mid = (nscv_smooth_formant$formant_norm[20,,2]),
+                            f1shorter = t(nscv_smooth_formant$formant_norm[shorter, , 1]),
+                            f2shorter = t(nscv_smooth_formant$formant_norm[shorter, , 2]),
+                            timeshorter = matrix(seq(0,1, length.out = length(shorter)), ncol=length(shorter), nrow=400, byrow=T),
+                            gapshorter = t(nscv_smooth_formant$formant_norm[shorter,,2] - nscv_smooth_formant$formant_norm[shorter,,1]))
+            }
+        
+        
+        
+        if (bam==F) {
+            m <- gam(formula, data=traindf, family=binomial(), ...)
+        } else {
+            m <- bam(formula, data=traindf, family=binomial())
+        }
+        pred_response[,i] <- predict(m, newdata=testdf, type='response')
+        pred_link[,i] <- predict(m, newdata=testdf, type='link') 
+        preds[,i] <- ifelse(pred_response[,i] > 0.5, 'S', 'N')
+        acc[i] <- sum(preds[,i]==testdf$accent)/100
+    }
+    
+    # model trained on all the data
+    if (bam==F) {
+        m_full <- gam(formula, data=fulldata, family=binomial(), ...)
+    } else {
+        m_full <- bam(formula, data=fulldata, family=binomial())
+    }
+    
+    return(list(cv_accuracy=acc,
+                cv_response=pred_response,
+                cv_link=pred_link,
+                cv_preds = preds,
+                model=m_full))
+    
+}
+
+# Helper function to view model evaluation statistics
+check_model <- function(formula, ...) {
+    cvmod = flr_cross_validate(formula=formula, fulldata = fulldata, ...)
+    print(paste('CV accuracy:', mean(cvmod$cv_accuracy*100)))
+    print(paste('AIC:', AIC(cvmod$model)))
+    print(paste('Degrees of freedom:', sum(cvmod$model$edf)))
+    print(summary(cvmod$model))
+    return(cvmod)
+}
+
 
 # ROC curve
 simple_roc <- function(labels, scores){
@@ -436,7 +687,7 @@ plotsoapfilm <- function(locationmodel, name='soapfilm', title='FLM'){
     image.plot(x=xscale, y=yscale, z=plogis(fit), asp=1.3,
                col=terrain.colors(100),
                xlab='', ylab='', 
-               zlim=zlimrange, axes=F, bty='n',
+               zlim=c(0.1, 0.9), axes=F, bty='n',
                main=paste0('Probability of Southern vowel: ', title))
     lines(bn, col='grey50')
     contour(x=xscale, y=yscale, z=plogis(fit), add=T, labcex = 0.7, nlevel=7)
@@ -444,8 +695,9 @@ plotsoapfilm <- function(locationmodel, name='soapfilm', title='FLM'){
     dev.off()
     
     pdf(paste0('output/figs/', title, name, '-se-maps.pdf'), width=4, height=4)
-    par(mar=c(0,0,1.5,0), mfrow=c(1,2), mgp=c(1.5,0.5,0))
-    image(x=pxscale, y=pyscale, z=plogis(pfit1-pfit2), asp=1.3, zlim=zlimrange,
+    par(mar=c(0,0,1.5,0), mgp=c(1.5,0.5,0), oma=c( 0,0,0,4), mfrow=c(1, 2))
+    
+    image(x=pxscale, y=pyscale, z=plogis(pfit1-pfit2), asp=1.3, zlim=c(0.1, 0.9),
           col=terrain.colors(100),
           xlab='', ylab='', axes=F)
     title('2.5th percentile', line=-2)
@@ -454,7 +706,7 @@ plotsoapfilm <- function(locationmodel, name='soapfilm', title='FLM'){
             nlevel=7)
     points(raw$lon, raw$lat, pch=3, cex=0.7)
     
-    image(x=pxscale, y=pyscale, z=plogis(pfit1+pfit2), asp=1.3, zlim=zlimrange,
+    image(x=pxscale, y=pyscale, z=plogis(pfit1+pfit2), asp=1.3, zlim=c(0.1, 0.9),
           col=terrain.colors(100),
           xlab='', ylab='', axes=F)
     title('97.5th percentile', line=-2)
@@ -463,5 +715,10 @@ plotsoapfilm <- function(locationmodel, name='soapfilm', title='FLM'){
             nlevel=7)
     points(raw$lon, raw$lat, pch=3, cex=0.7)
     mtext(paste('Confidence interval:', title), side = 3, line = -1.5, outer = TRUE)
+    
+    par(oma=c( 0,0,0,1))# reset margin to be much smaller for overplotting legend
+    image.plot( legend.only=TRUE, zlim=c(0.1, 0.9), 
+                col=terrain.colors(100), legend.shrink = 0.5)
+    
     dev.off()
 }
